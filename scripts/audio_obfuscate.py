@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audio_obfuscate.py  (v2)
-========================
+audio_obfuscate.py  (v2.1)
+=========================
 在尽量保留音乐节奏骨架的前提下，对音频做“结构性指纹扰动”，
 目标是绕过 Suno 等平台 "This audio matches an existing recording" 的录音匹配。
 
-为什么 v1（整体移调+轻EQ）可能失败
-----------------------------------
-现代匹配常用 chroma/旋律特征（对“整体移调”天然不变）或 AI 音频向量（对 EQ/混响/压缩鲁棒）。
-因此 v2 增加三类“结构性”扰动：
+实战经验（默认推荐）
+--------------------
+单次 medium 可能仍被匹配；把 medium【连续处理两次】（--runs 2，两次完整流程、
+使用不同随机曲线）后更容易通过。--runs 即把整套“结构变换 + 音色链”串联执行 N 次。
 
-1) 时间轴非线性弹性 (warp)
-   把音频按约 10 秒一段，每段用略微不同的速度（默认 ±2.5% 内缓慢起伏，像真人 rubato），
-   再交叉淡化拼接；并归一化使【平均速度=1、总时长基本不变、节拍数量与骨架不变】，
-   但破坏指纹所需的“严格时间对齐”。对传统指纹和 AI 对齐都有效。
-2) 移调缓慢漂移 (pitch drift)
-   每段在基准移调上再做缓慢随机漂移（默认 ±0.2 半音），破坏稳定的 chroma/旋律特征。
-3) 音色/谐波重塑
-   chorus(合唱) + aphaser(相位) + 极轻 tanh 软饱和 + EQ + 短空间感，改变谐波结构与音色向量；
-   这些只动音色，不动节拍位置。
+为什么整体移调 + 轻 EQ 可能失败
+------------------------------
+现代匹配常用 chroma/旋律特征（对“整体移调”天然不变）或 AI 音频向量（对 EQ/混响/压缩鲁棒）。
+本工具的三类“结构性”扰动：
+1) 时间轴非线性弹性 (warp)：约 10 秒一段，每段在小幅范围内缓慢变速再交叉淡化拼接，
+   归一化使平均速度=1、总时长基本不变、节拍数量与骨架不变，但破坏严格时间对齐。
+2) 移调缓慢漂移 (pitch drift)：每段在基准移调上再做缓慢随机漂移，破坏稳定 chroma/旋律特征。
+3) 音色/谐波重塑：chorus + aphaser + 极轻 tanh 软饱和 + EQ + 短空间感，改变谐波与音色向量。
 
 重要声明
 --------
 - 只提高匹配难度，【不保证 100% 绕过】；不改变原作品版权归属。
 - 仅可对你【自有或已获授权】的素材使用，并遵守目标平台条款。
-- warp 会带来极轻微“弹性节奏”（平均 BPM 不变）；若要绝对刚性节奏可用 --warp 0，但更可能被匹配。
+- 多轮叠加会累积移调/音色变化（--runs 2 的累计移调约为单轮两倍），听感变化随之增大。
 
 依赖：ffmpeg/ffprobe 在 PATH；Python 需 numpy、scipy。
 """
@@ -33,6 +32,7 @@ audio_obfuscate.py  (v2)
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,12 +41,12 @@ import numpy as np
 from scipy.io import wavfile
 
 SR = 44100
-AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma")
+AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma", ".mp4")
 SEG = SR * 10          # 每段 10 秒
 XFADE = SR // 25       # 40ms 交叉淡化
 
-# v2 档位：base 基准移调(半音) / warp 时间弹性幅度 / drift 移调漂移(半音) /
-#          sat 软饱和 / chorus / phaser decay / bass / treble / echo / comp ratio
+# 档位：base 基准移调(半音) / warp 时间弹性幅度 / drift 移调漂移(半音) /
+#       sat 软饱和 / chorus / phdec 相位decay / bass / treble / echo / ratio 压缩比
 PRESETS = {
     "light": dict(
         base=0.8, warp=0.015, drift=0.10, sat=1.08,
@@ -193,12 +193,7 @@ def structural_transform(x, base, warp_amp, drift_amp, global_tempo, seed):
             print("        段 %02d/%d  tempo %.4f  pitch %+.2f 半音"
                   % (i + 1, N, tempo[i], pitch_sem[i]))
     finally:
-        for fn in os.listdir(work):
-            try:
-                os.unlink(os.path.join(work, fn))
-            except OSError:
-                pass
-        os.rmdir(work)
+        shutil.rmtree(work, ignore_errors=True)
     return out
 
 
@@ -208,8 +203,9 @@ def soft_saturate(x, amount):
     return np.tanh(x * amount) / np.tanh(amount)
 
 
-def final_chain_to_mp3(wav_in, dst, p, bitrate, keep_meta):
-    cf = [
+def chain_filters(p):
+    """音色 + 响度归一滤镜链（中间轮与最终输出共用）。"""
+    return [
         "chorus=%s" % p["chorus"],
         "aphaser=in_gain=0.9:out_gain=0.85:delay=3:decay=%.2f:speed=0.6:type=t" % p["phdec"],
         "bass=gain=%.2f:frequency=150" % p["bass"],
@@ -218,8 +214,21 @@ def final_chain_to_mp3(wav_in, dst, p, bitrate, keep_meta):
         "acompressor=threshold=-21dB:ratio=%.1f:attack=12:release=220:knee=2.5:makeup=2" % p["ratio"],
         "loudnorm=I=-14:TP=-1.2:LRA=11",
     ]
+
+
+def chain_wav_to_wav(wav_in, wav_out, p):
+    """中间轮：应用完整音色链，输出 PCM wav。"""
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-           "-i", wav_in, "-filter_complex", ",".join(cf),
+           "-i", wav_in, "-filter_complex", ",".join(chain_filters(p)),
+           "-ar", str(SR), "-c:a", "pcm_s16le", wav_out]
+    code, _, err = run(cmd)
+    if code != 0:
+        fail("中间轮音色链失败：%s" % err.strip())
+
+
+def final_chain_to_mp3(wav_in, dst, p, bitrate, keep_meta):
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-i", wav_in, "-filter_complex", ",".join(chain_filters(p)),
            "-ar", str(SR), "-c:a", "libmp3lame", "-b:a", bitrate]
     if not keep_meta:
         cmd += ["-map_metadata", "-1"]
@@ -229,10 +238,14 @@ def final_chain_to_mp3(wav_in, dst, p, bitrate, keep_meta):
         fail("末段编码失败：%s" % err.strip())
 
 
-def default_output(src, tag="_obf2"):
+def default_tag(runs):
+    return "_obf2" if runs <= 1 else "_obf2x%d" % runs
+
+
+def default_output(src, runs):
     d = os.path.dirname(src)
     name, ext = os.path.splitext(os.path.basename(src))
-    return os.path.join(d, name + tag + (ext or ".mp3"))
+    return os.path.join(d, name + default_tag(runs) + ".mp3")
 
 
 def process_one(src, dst, args):
@@ -244,26 +257,39 @@ def process_one(src, dst, args):
     base = args.semitones if args.semitones is not None else p["base"]
     warp_amp = args.warp if args.warp is not None else p["warp"]
     drift_amp = args.drift if args.drift is not None else p["drift"]
-    seed = args.seed if args.seed is not None else int(np.random.randint(1, 99999))
+    runs = max(1, args.runs)
+    seed0 = args.seed if args.seed is not None else int(np.random.randint(1, 99999))
 
     print("[处理] %s" % os.path.basename(src))
-    print("        档位 %s | 基准移调 %+.2f 半音 | 弹性 ±%.1f%% | 漂移 ±%.2f | 整体 x%.3f"
-          % (args.preset, base, warp_amp * 100, drift_amp, args.tempo))
+    print("        档位 %s | 轮数 %d | 单轮移调 %+.2f | 弹性 ±%.1f%% | 漂移 ±%.2f | 整体 x%.3f"
+          % (args.preset, runs, base, warp_amp * 100, drift_amp, args.tempo))
 
     x = read_audio(src)
-    x = structural_transform(x, base, warp_amp, drift_amp, args.tempo, seed)
-    x = soft_saturate(x, p["sat"])
-
-    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
-    tmpwav = dst + ".tmp.wav"
-    write_wav(tmpwav, x)
-    final_chain_to_mp3(tmpwav, dst, p, args.bitrate, args.keep_meta)
-    os.unlink(tmpwav)
+    tmpdir = tempfile.mkdtemp(prefix="obfruns_")
+    try:
+        for r in range(runs):
+            print("    ---- 第 %d/%d 轮 (seed %d) ----" % (r + 1, runs, seed0 + r * 7919))
+            x = structural_transform(x, base, warp_amp, drift_amp,
+                                     args.tempo, seed0 + r * 7919)
+            x = soft_saturate(x, p["sat"])
+            cur = os.path.join(tmpdir, "cur_%d.wav" % r)
+            write_wav(cur, x)
+            if r == runs - 1:
+                final_chain_to_mp3(cur, dst, p, args.bitrate, args.keep_meta)
+            else:
+                nxt = os.path.join(tmpdir, "nxt_%d.wav" % r)
+                chain_wav_to_wav(cur, nxt, p)
+                sr2, d2 = wavfile.read(nxt)
+                x = d2.astype(np.float32) / 32768.0
+                if x.ndim == 1:
+                    x = np.stack([x, x], axis=1)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     after = probe(dst)
     dt = after["duration"] - before["duration"]
     print("[完成] -> %s" % dst)
-    print("        时长 %.2fs -> %.2fs (差 %+.2fs) | 平均 BPM 变化 %+.2f%%"
+    print("        时长 %.2fs -> %.2fs (差 %+.2fs) | 单轮平均 BPM 变化 %+.2f%%"
           % (before["duration"], after["duration"], dt, (args.tempo - 1) * 100))
     return True
 
@@ -292,16 +318,18 @@ def collect_inputs(items):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="保节奏骨架的结构性音频指纹扰动 v2（ffmpeg rubberband + numpy）。")
-    ap.add_argument("inputs", nargs="+", help="音频文件 / 文件夹 / 通配（可多个）")
-    ap.add_argument("-o", "--out", default=None, help="输出文件或目录；默认加 _obf2 后缀")
+        description="保节奏骨架的音频指纹扰动 v2.1（rubberband + numpy，支持 --runs 多轮）。")
+    ap.add_argument("inputs", nargs="+", help="音频/视频文件 / 文件夹 / 通配（可多个）")
+    ap.add_argument("-o", "--out", default=None, help="输出文件或目录；默认加 _obf2 / _obf2xN 后缀")
     ap.add_argument("--preset", choices=list(PRESETS), default="medium")
-    ap.add_argument("--semitones", type=float, default=None, help="基准移调半音（覆盖档位）")
+    ap.add_argument("--runs", type=int, default=1,
+                    help="完整处理的轮数，默认1；实战推荐 --runs 2（medium 连跑两次更易过）")
+    ap.add_argument("--semitones", type=float, default=None, help="单轮基准移调半音（覆盖档位）")
     ap.add_argument("--warp", type=float, default=None, help="时间弹性幅度，如 0.025；0 关闭")
     ap.add_argument("--drift", type=float, default=None, help="移调漂移(半音)，0 关闭")
     ap.add_argument("--tempo", type=float, default=1.0, help="整体速度倍率，默认1（最后手段）")
     ap.add_argument("--bitrate", default="320k")
-    ap.add_argument("--seed", type=int, default=None, help="固定随机种子（可复现）")
+    ap.add_argument("--seed", type=int, default=None, help="首轮随机种子（可复现）")
     ap.add_argument("--keep-meta", action="store_true", help="保留元数据（默认清除）")
     args = ap.parse_args()
 
@@ -310,18 +338,19 @@ def main():
 
     files = collect_inputs(args.inputs)
     if not files:
-        fail("没有可处理的音频。")
+        fail("没有可处理的音视频。")
 
     multi = len(files) > 1
     out_dir = args.out if (args.out and os.path.isdir(args.out)) else None
+    tag = default_tag(max(1, args.runs))
     ok = 0
     for src in files:
         if multi or out_dir:
             d = out_dir or os.path.dirname(src)
-            name, ext = os.path.splitext(os.path.basename(src))
-            dst = os.path.join(d, name + "_obf2" + (ext or ".mp3"))
+            name, _ext = os.path.splitext(os.path.basename(src))
+            dst = os.path.join(d, name + tag + ".mp3")
         else:
-            dst = args.out or default_output(src)
+            dst = args.out or default_output(src, max(1, args.runs))
         if process_one(src, dst, args):
             ok += 1
         print("-" * 70)
